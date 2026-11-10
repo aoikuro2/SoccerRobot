@@ -1,7 +1,7 @@
+import time
 
 import cv2
 import numpy as np
-import time
 import mediapipe as mp
 
 from mediapipe.tasks import python
@@ -9,17 +9,39 @@ from mediapipe.tasks.python import vision
 
 
 # ==========================================
+# 0. SETTINGS (ubah di sini saja)
+# ==========================================
+
+CAMERA_INDEX = 3                      # /dev/video3
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+
+MODEL_PATH = "efficientdet_lite0.tflite"
+SCORE_THRESHOLD = 0.35
+
+# Warna merah di HSV (hasil kalibrasi).
+# Merah ada di dua ujung roda warna, jadi butuh dua rentang.
+LOWER_RED1 = np.array([0, 131, 60])
+UPPER_RED1 = np.array([7, 255, 255])
+LOWER_RED2 = np.array([179, 131, 60])
+UPPER_RED2 = np.array([179, 255, 255])
+
+MIN_RED_RATIO = 0.08       # minimal persentase piksel merah di dalam kotak MediaPipe
+MIN_AREA = 300             # luas minimal kontur untuk fallback OpenCV
+MIN_CIRCULARITY = 0.35     # 1.0 = lingkaran sempurna
+CENTER_DEADZONE = 40       # piksel; selisih kecil dari tengah dianggap "CENTER"
+
+KERNEL = np.ones((7, 7), np.uint8)
+
+
+# ==========================================
 # 1. LOAD MEDIAPIPE MODEL
 # ==========================================
 
-MODEL_PATH = "efficientdet_lite0.tflite"
-
-BaseOptions = python.BaseOptions
-
 options = vision.ObjectDetectorOptions(
-    base_options=BaseOptions(model_asset_path=MODEL_PATH),
-    score_threshold=0.35,
-    running_mode=vision.RunningMode.VIDEO
+    base_options=python.BaseOptions(model_asset_path=MODEL_PATH),
+    score_threshold=SCORE_THRESHOLD,
+    running_mode=vision.RunningMode.VIDEO,
 )
 
 detector = vision.ObjectDetector.create_from_options(options)
@@ -29,101 +51,45 @@ detector = vision.ObjectDetector.create_from_options(options)
 # 2. CAMERA SETUP
 # ==========================================
 
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
 
 if not cap.isOpened():
     print("Error: Cannot open camera!")
-    exit()
+    detector.close()
+    raise SystemExit(1)
 
-# Camera resolution
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-
-# ==========================================
-# 3. ORANGE COLOR RANGE (HSV)
-# ==========================================
-
-# Adjust these values depending on your ball
-LOWER_ORANGE = np.array([5, 100, 100])
-UPPER_ORANGE = np.array([25, 255, 255])
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
 
 # ==========================================
-# 4. MAIN DETECTION LOOP
+# 3. HELPER FUNCTIONS
 # ==========================================
 
-print("Starting Soccer Ball Detection...")
-print("Press Q to quit.")
+def make_red_mask(hsv_image):
+    """Buat mask piksel merah (dua rentang digabung), lalu bersihkan noise."""
+    mask1 = cv2.inRange(hsv_image, LOWER_RED1, UPPER_RED1)
+    mask2 = cv2.inRange(hsv_image, LOWER_RED2, UPPER_RED2)
+    mask = cv2.bitwise_or(mask1, mask2)
 
-while True:
+    # OPEN: hapus bintik kecil. CLOSE: tutup lubang kecil di badan bola.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, KERNEL, iterations=2)
+    return mask
 
-    ret, frame = cap.read()
 
-    if not ret:
-        print("Cannot receive camera frame.")
-        break
-
+def find_ball_mediapipe(frame, mask, last_timestamp):
+    """Cari 'sports ball' lewat MediaPipe, lalu pastikan ada piksel merah di dalamnya."""
     height, width = frame.shape[:2]
 
-    # Convert BGR to HSV
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-    # Create orange color mask
-    mask = cv2.inRange(
-        hsv,
-        LOWER_ORANGE,
-        UPPER_ORANGE
-    )
+    # Timestamp harus selalu naik, kalau tidak MediaPipe akan error.
+    timestamp_ms = max(time.monotonic_ns() // 1_000_000, last_timestamp + 1)
+    result = detector.detect_for_video(mp_image, timestamp_ms)
 
-    # Remove small noise
-    kernel = np.ones((5, 5), np.uint8)
-
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_OPEN,
-        kernel
-    )
-
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        kernel
-    )
-
-    # ======================================
-    # MEDIAPIPE OBJECT DETECTION
-    # ======================================
-
-    rgb_frame = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2RGB
-    )
-
-    mp_image = mp.Image(
-        image_format=mp.ImageFormat.SRGB,
-        data=rgb_frame
-    )
-
-    timestamp_ms = time.monotonic_ns() // 1_000_000
-
-    detection_result = detector.detect_for_video(
-        mp_image,
-        timestamp_ms
-    )
-
-    ball_found = False
-    ball_x = 0
-    ball_y = 0
-    ball_radius = 0
-
-    # ======================================
-    # 5. FIND ORANGE SPORTS BALL
-    # ======================================
-
-    # First, check MediaPipe sports ball detections
-    for detection in detection_result.detections:
-
+    for detection in result.detections:
         category = detection.categories[0]
 
         if category.category_name.lower() != "sports ball":
@@ -133,183 +99,183 @@ while True:
 
         x1 = max(0, bbox.origin_x)
         y1 = max(0, bbox.origin_y)
-
-        x2 = min(width, x1 + bbox.width)
-        y2 = min(height, y1 + bbox.height)
+        x2 = min(width, bbox.origin_x + bbox.width)
+        y2 = min(height, bbox.origin_y + bbox.height)
 
         if x2 <= x1 or y2 <= y1:
             continue
 
-        # Check orange pixels inside the detected object
         ball_mask = mask[y1:y2, x1:x2]
+        red_ratio = cv2.countNonZero(ball_mask) / max(ball_mask.size, 1)
 
-        orange_pixels = cv2.countNonZero(ball_mask)
+        if red_ratio <= MIN_RED_RATIO:
+            continue
 
-        total_pixels = ball_mask.size
+        moments = cv2.moments(ball_mask)
+        if moments["m00"] <= 0:
+            continue
 
-        orange_ratio = orange_pixels / max(
-            total_pixels, 1
-        )
+        x = int(x1 + moments["m10"] / moments["m00"])
+        y = int(y1 + moments["m01"] / moments["m00"])
+        radius = max(5, min(bbox.width, bbox.height) // 2)
 
-        # Require some orange pixels
-        if orange_ratio > 0.08:
+        return (x, y, radius), timestamp_ms
 
-            M = cv2.moments(ball_mask)
+    return None, timestamp_ms
 
-            if M["m00"] > 0:
 
-                ball_x = int(
-                    x1 + M["m10"] / M["m00"]
-                )
+def find_ball_opencv(mask):
+    """Fallback: cari objek merah yang bentuknya mendekati lingkaran."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                ball_y = int(
-                    y1 + M["m01"] / M["m00"]
-                )
+    best = None
+    best_area = 0
 
-                ball_radius = max(
-                    5, min(bbox.width, bbox.height) // 2
-                )
+    for contour in contours:
+        # Convex hull menutup lekukan (jahitan, bagian mengkilap) sebelum dihitung
+        hull = cv2.convexHull(contour)
 
-                ball_found = True
-                break
+        area = cv2.contourArea(hull)
+        if area < MIN_AREA:
+            continue
 
-    # ======================================
-    # 6. OPENCV FALLBACK
-    # ======================================
+        perimeter = cv2.arcLength(hull, True)
+        if perimeter == 0:
+            continue
 
-    # If MediaPipe does not recognize the ball,
-    # search for orange circular objects directly.
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        if circularity < MIN_CIRCULARITY:
+            continue
 
-    if not ball_found:
+        if area > best_area:
+            (x, y), radius = cv2.minEnclosingCircle(hull)
+            best = (int(x), int(y), int(radius))
+            best_area = area
 
-        contours, _ = cv2.findContours(
-            mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
-        )
+    return best
 
-        best_area = 0
 
-        for contour in contours:
+def steering_text(ball_x, width):
+    """Kasih tahu bola ada di kiri / kanan / tengah relatif ke kamera."""
+    error = ball_x - width // 2
 
-            area = cv2.contourArea(contour)
-
-            if area < 300:
-                continue
-
-            perimeter = cv2.arcLength(
-                contour, True
-            )
-
-            if perimeter == 0:
-                continue
-
-            circularity = (
-                4 * np.pi * area /
-                (perimeter * perimeter)
-            )
-
-            # Filter out very irregular shapes
-            if circularity < 0.35:
-                continue
-
-            (x, y), radius = cv2.minEnclosingCircle(
-                contour
-            )
-
-            if area > best_area:
-
-                best_area = area
-
-                ball_x = int(x)
-                ball_y = int(y)
-                ball_radius = int(radius)
-
-                ball_found = True
-
-    # ======================================
-    # 7. DISPLAY RESULTS
-    # ======================================
-
-    if ball_found:
-
-        # Draw circle around ball
-        cv2.circle(
-            frame,
-            (ball_x, ball_y),
-            ball_radius,
-            (0, 255, 0),
-            3
-        )
-
-        # Draw center point
-        cv2.circle(
-            frame,
-            (ball_x, ball_y),
-            5,
-            (0, 0, 255),
-            -1
-        )
-
-        # Display coordinates
-        cv2.putText(
-            frame,
-            f"BALL FOUND: X={ball_x}, Y={ball_y}",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-
-        print(
-            f"Ball Position: X={ball_x}, Y={ball_y}"
-        )
-
-    else:
-
-        cv2.putText(
-            frame,
-            "SEARCHING FOR BALL...",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 0, 255),
-            2
-        )
-
-    # Draw camera center
-    cv2.line(
-        frame,
-        (width // 2, 0),
-        (width // 2, height),
-        (255, 0, 0),
-        1
-    )
-
-    # Show camera image
-    cv2.imshow(
-        "Soccer Robot - Ball Detection",
-        frame
-    )
-
-    # Show orange mask for debugging
-    cv2.imshow(
-        "Orange Detection Mask",
-        mask
-    )
-
-    # Quit with Q
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    if abs(error) <= CENTER_DEADZONE:
+        return "CENTER", error
+    if error < 0:
+        return "LEFT", error
+    return "RIGHT", error
 
 
 # ==========================================
-# 8. CLEANUP
+# 4. MAIN DETECTION LOOP
 # ==========================================
 
-cap.release()
-detector.close()
-cv2.destroyAllWindows()
+print("Starting Soccer Ball Detection...")
+print("Press Q to quit.")
 
-print("Program stopped.")
+last_timestamp = 0
+last_printed = None
+
+try:
+    while True:
+
+        ret, frame = cap.read()
+
+        if not ret:
+            print("Cannot receive camera frame.")
+            break
+
+        height, width = frame.shape[:2]
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = make_red_mask(hsv)
+
+        # 1) MediaPipe dulu, 2) kalau gagal pakai deteksi warna + bentuk
+        ball, last_timestamp = find_ball_mediapipe(frame, mask, last_timestamp)
+        source = "MediaPipe"
+
+        if ball is None:
+            ball = find_ball_opencv(mask)
+            source = "OpenCV"
+
+        # ==================================
+        # 5. DISPLAY RESULTS
+        # ==================================
+
+        if ball is not None:
+            ball_x, ball_y, ball_radius = ball
+            direction, error = steering_text(ball_x, width)
+
+            cv2.circle(frame, (ball_x, ball_y), ball_radius, (0, 255, 0), 3)
+            cv2.circle(frame, (ball_x, ball_y), 5, (0, 0, 255), -1)
+
+            cv2.putText(
+                frame,
+                f"BALL FOUND ({source}): X={ball_x}, Y={ball_y}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
+            cv2.putText(
+                frame,
+                f"{direction} (offset {error:+d} px)",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
+
+            # Print hanya kalau arahnya berubah, supaya terminal tidak banjir
+            if direction != last_printed:
+                print(f"Ball: X={ball_x}, Y={ball_y}, direction={direction}")
+                last_printed = direction
+
+        else:
+            cv2.putText(
+                frame,
+                "SEARCHING FOR BALL...",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
+            )
+
+            if last_printed != "LOST":
+                print("Ball lost")
+                last_printed = "LOST"
+
+        # Garis tengah kamera dan zona "CENTER"
+        cv2.line(frame, (width // 2, 0), (width // 2, height), (255, 0, 0), 1)
+        cv2.line(
+            frame,
+            (width // 2 - CENTER_DEADZONE, 0),
+            (width // 2 - CENTER_DEADZONE, height),
+            (120, 120, 120),
+            1,
+        )
+        cv2.line(
+            frame,
+            (width // 2 + CENTER_DEADZONE, 0),
+            (width // 2 + CENTER_DEADZONE, height),
+            (120, 120, 120),
+            1,
+        )
+
+        cv2.imshow("Soccer Robot - Ball Detection", frame)
+        cv2.imshow("Red Detection Mask", mask)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+finally:
+    # ==================================
+    # 6. CLEANUP
+    # ==================================
+    cap.release()
+    detector.close()
+    cv2.destroyAllWindows()
+    print("Program stopped.")
