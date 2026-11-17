@@ -14,7 +14,7 @@ from mediapipe.tasks.python import vision
 # ==========================================
 
 # Camera settings (the supplied detector uses Linux /dev/video3).
-CAMERA_INDEX = 3
+CAMERA_INDEX = 1
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 USE_V4L2 = True
@@ -30,7 +30,7 @@ BAUD_RATE = 115200
 
 # Keep False for the first tests. Set True only after checking the robot
 # with its wheels lifted and a physical battery disconnect within reach.
-MOTORS_ENABLED = False
+MOTORS_ENABLED = True
 
 # Motor speeds: start conservatively and tune after testing.
 SEARCH_SPEED = 75
@@ -45,11 +45,11 @@ STOP_RADIUS = 55
 COMMAND_INTERVAL = 0.10
 LOST_FRAMES_BEFORE_SEARCH = 4
 
-# Red ball HSV ranges (from the user's calibrated detector).
-LOWER_RED1 = np.array([0, 131, 60])
-UPPER_RED1 = np.array([7, 255, 255])
-LOWER_RED2 = np.array([179, 131, 60])
-UPPER_RED2 = np.array([179, 255, 255])
+# Red ball HSV ranges (from calibrate.py, with the camera locked).
+LOWER_RED1 = np.array([0, 150, 25])
+UPPER_RED1 = np.array([18, 255, 255])
+LOWER_RED2 = np.array([158, 150, 25])
+UPPER_RED2 = np.array([164, 255, 255])
 
 MIN_RED_RATIO = 0.08
 MIN_AREA = 300
@@ -74,6 +74,17 @@ detector = vision.ObjectDetector.create_from_options(options)
 # 2. CAMERA SETUP
 # ==========================================
 
+def lock_camera(cap):
+    """Lock exposure, white balance and focus (values from calibrate.py)."""
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+    cap.set(cv2.CAP_PROP_EXPOSURE, 85)
+    cap.set(cv2.CAP_PROP_GAIN, 64)
+    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+    cap.set(cv2.CAP_PROP_WB_TEMPERATURE, 4900)
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+    cap.set(cv2.CAP_PROP_FOCUS, 0)
+
+
 if USE_V4L2:
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
 else:
@@ -88,6 +99,7 @@ if not cap.isOpened():
 
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+lock_camera(cap)
 
 
 # ==========================================
