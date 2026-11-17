@@ -7,7 +7,7 @@ import numpy as np
 # ==========================================
 # SETTINGS
 # ==========================================
-CAMERA_INDEX = 1      # samakan dengan CAMERA_INDEX di robot.py
+CAMERA_INDEX = 3      # samakan dengan CAMERA_INDEX di robot.py
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 

@@ -1,478 +1,280 @@
-import time
 
 import cv2
 import numpy as np
 import serial
-import mediapipe as mp
-
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-
+import time
 
 # ==========================================
-# 0. SETTINGS
+# SETTINGS
 # ==========================================
 
-# Camera settings (the supplied detector uses Linux /dev/video3).
-CAMERA_INDEX = 1
+CAMERA_INDEX = 3
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
-USE_V4L2 = True
 
-MODEL_PATH = "efficientdet_lite0.tflite"
-SCORE_THRESHOLD = 0.35
-
-# Arduino serial settings.
-# Raspberry Pi examples: /dev/ttyACM0 or /dev/ttyUSB0
-# Windows example: COM11
-SERIAL_PORT = "/dev/ttyACM0"
+SERIAL_PORT = "COM11"
 BAUD_RATE = 115200
 
-# Keep False for the first tests. Set True only after checking the robot
-# with its wheels lifted and a physical battery disconnect within reach.
-MOTORS_ENABLED = True
+# Replace these with your FINAL calibrated HSV values.
+LOWER_RED1 = np.array([0, 120, 70])
+UPPER_RED1 = np.array([15, 255, 255])
 
-# Motor speeds: start conservatively and tune after testing.
-SEARCH_SPEED = 75
-TURN_SPEED = 100
-APPROACH_SPEED = 110
+LOWER_RED2 = np.array([172, 120, 70])
+UPPER_RED2 = np.array([179, 255, 255])
 
-# Ball positioning and stopping.
-CENTER_DEADZONE = 40
-STOP_RADIUS = 55
+# Ball detection
+MIN_BALL_AREA = 300
 
-# Control loop settings.
-COMMAND_INTERVAL = 0.10
-LOST_FRAMES_BEFORE_SEARCH = 4
+# Movement settings
+FORWARD_SPEED = 65
+MAX_TURN_SPEED = 90
+MIN_TURN_SPEED = 35
 
-# Red ball HSV ranges (from calibrate.py, with the camera locked).
-LOWER_RED1 = np.array([0, 150, 25])
-UPPER_RED1 = np.array([18, 255, 255])
-LOWER_RED2 = np.array([158, 150, 25])
-UPPER_RED2 = np.array([164, 255, 255])
+CENTER_TOLERANCE = 45
+KP = 0.35
 
-MIN_RED_RATIO = 0.08
-MIN_AREA = 300
-MIN_CIRCULARITY = 0.35
-KERNEL = np.ones((7, 7), np.uint8)
+# Tune this after testing the ball's apparent size.
+STOP_AREA = 15000
 
+# Motor direction correction.
+# Change to -1 if a motor runs in the wrong direction.
+LEFT_POLARITY = 1
+RIGHT_POLARITY = 1
 
 # ==========================================
-# 1. MEDIAPIPE MODEL
+# SERIAL CONNECTION
 # ==========================================
 
-options = vision.ObjectDetectorOptions(
-    base_options=python.BaseOptions(model_asset_path=MODEL_PATH),
-    score_threshold=SCORE_THRESHOLD,
-    running_mode=vision.RunningMode.VIDEO,
+arduino = serial.Serial(
+    SERIAL_PORT,
+    BAUD_RATE,
+    timeout=0.1
 )
 
-detector = vision.ObjectDetector.create_from_options(options)
+time.sleep(2)
+
+def send_motor(left, right):
+    left = int(np.clip(left, -255, 255))
+    right = int(np.clip(right, -255, 255))
+
+    left *= LEFT_POLARITY
+    right *= RIGHT_POLARITY
+
+    command = f"{left},{right}\n"
+    arduino.write(command.encode())
+
+
+def stop_robot():
+    send_motor(0, 0)
 
 
 # ==========================================
-# 2. CAMERA SETUP
+# CAMERA
 # ==========================================
 
-def lock_camera(cap):
-    """Lock exposure, white balance and focus (values from calibrate.py)."""
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-    cap.set(cv2.CAP_PROP_EXPOSURE, 85)
-    cap.set(cv2.CAP_PROP_GAIN, 64)
-    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-    cap.set(cv2.CAP_PROP_WB_TEMPERATURE, 4900)
-    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-    cap.set(cv2.CAP_PROP_FOCUS, 0)
-
-
-if USE_V4L2:
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
-else:
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
 
 if not cap.isOpened():
-    detector.close()
-    raise SystemExit(
-        f"Cannot open camera index {CAMERA_INDEX}. "
-        "Check CAMERA_INDEX and USE_V4L2."
-    )
+    arduino.close()
+    raise SystemExit("Cannot open camera.")
 
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-lock_camera(cap)
-
 
 # ==========================================
-# 3. ARDUINO SERIAL SETUP
+# BALL DETECTION
 # ==========================================
 
-try:
-    arduino = serial.Serial(
-        SERIAL_PORT,
-        BAUD_RATE,
-        timeout=1,
-        write_timeout=1,
+def detect_ball(frame):
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    mask1 = cv2.inRange(
+        hsv, LOWER_RED1, UPPER_RED1
     )
-    # Arduino Uno may reset when the serial port is opened.
-    time.sleep(2)
-    arduino.reset_input_buffer()
-    print(f"Arduino connected on {SERIAL_PORT}")
 
-except serial.SerialException as error:
-    cap.release()
-    detector.close()
-    cv2.destroyAllWindows()
-    raise SystemExit(f"Could not connect to Arduino: {error}")
+    mask2 = cv2.inRange(
+        hsv, LOWER_RED2, UPPER_RED2
+    )
 
-
-# ==========================================
-# 4. BALL DETECTION FUNCTIONS
-# ==========================================
-
-def make_red_mask(hsv_image):
-    """Create and clean a mask containing the calibrated red color."""
-    mask1 = cv2.inRange(hsv_image, LOWER_RED1, UPPER_RED1)
-    mask2 = cv2.inRange(hsv_image, LOWER_RED2, UPPER_RED2)
     mask = cv2.bitwise_or(mask1, mask2)
 
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL)
+    # Remove small noise
+    kernel = np.ones((5, 5), np.uint8)
+
     mask = cv2.morphologyEx(
-        mask, cv2.MORPH_CLOSE, KERNEL, iterations=2
-    )
-    return mask
-
-
-def find_ball_mediapipe(frame, mask, last_timestamp):
-    """Find a MediaPipe sports-ball candidate and validate its red pixels."""
-    height, width = frame.shape[:2]
-
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(
-        image_format=mp.ImageFormat.SRGB,
-        data=rgb_frame,
+        mask, cv2.MORPH_OPEN, kernel
     )
 
-    timestamp_ms = max(
-        time.monotonic_ns() // 1_000_000,
-        last_timestamp + 1,
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, kernel
     )
-    result = detector.detect_for_video(mp_image, timestamp_ms)
 
-    for detection in result.detections:
-        if not detection.categories:
-            continue
-
-        category = detection.categories[0]
-        if category.category_name.lower() != "sports ball":
-            continue
-
-        bbox = detection.bounding_box
-
-        x1 = max(0, bbox.origin_x)
-        y1 = max(0, bbox.origin_y)
-        x2 = min(width, bbox.origin_x + bbox.width)
-        y2 = min(height, bbox.origin_y + bbox.height)
-
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        ball_mask = mask[y1:y2, x1:x2]
-        red_ratio = cv2.countNonZero(ball_mask) / max(ball_mask.size, 1)
-
-        if red_ratio <= MIN_RED_RATIO:
-            continue
-
-        moments = cv2.moments(ball_mask)
-        if moments["m00"] <= 0:
-            continue
-
-        ball_x = int(x1 + moments["m10"] / moments["m00"])
-        ball_y = int(y1 + moments["m01"] / moments["m00"])
-        ball_radius = max(5, min(bbox.width, bbox.height) // 2)
-
-        return (ball_x, ball_y, ball_radius), timestamp_ms
-
-    return None, timestamp_ms
-
-
-def find_ball_opencv(mask):
-    """Fallback: find the largest sufficiently circular red contour."""
     contours, _ = cv2.findContours(
         mask,
         cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE,
+        cv2.CHAIN_APPROX_SIMPLE
     )
 
-    best_ball = None
-    best_area = 0
+    if not contours:
+        return None, mask
 
-    for contour in contours:
-        hull = cv2.convexHull(contour)
-        area = cv2.contourArea(hull)
+    largest = max(contours, key=cv2.contourArea)
 
-        if area < MIN_AREA:
-            continue
+    area = cv2.contourArea(largest)
 
-        perimeter = cv2.arcLength(hull, True)
-        if perimeter == 0:
-            continue
+    if area < MIN_BALL_AREA:
+        return None, mask
 
-        circularity = 4 * np.pi * area / (perimeter * perimeter)
-        if circularity < MIN_CIRCULARITY:
-            continue
+    x, y, w, h = cv2.boundingRect(largest)
 
-        if area > best_area:
-            (x, y), radius = cv2.minEnclosingCircle(hull)
-            best_ball = (int(x), int(y), int(radius))
-            best_area = area
+    center_x = x + w // 2
+    center_y = y + h // 2
 
-    return best_ball
+    ball = {
+        "x": center_x,
+        "y": center_y,
+        "area": area,
+        "box": (x, y, w, h)
+    }
+
+    return ball, mask
 
 
 # ==========================================
-# 5. AUTONOMOUS MOVEMENT
+# ROBOT MOVEMENT
 # ==========================================
 
-def decide_movement(ball, camera_width):
-    """
-    Return state and motor speeds.
+def follow_ball(ball):
 
-    Motor direction convention from the robot's previous hardware tests:
-      (-speed, -speed) = forward
-      ( speed,  speed) = backward
-      ( speed,-speed) = turn left
-      (-speed, speed) = turn right
-    """
     if ball is None:
-        return "SEARCH", SEARCH_SPEED, -SEARCH_SPEED
+        stop_robot()
+        print("Ball not detected")
+        return
 
-    ball_x, ball_y, ball_radius = ball
-    error_x = ball_x - (camera_width // 2)
+    ball_x = ball["x"]
+    ball_area = ball["area"]
 
-    # Stop when the ball is close enough.
-    if ball_radius >= STOP_RADIUS:
-        return "STOP", 0, 0
+    frame_center = FRAME_WIDTH // 2
 
-    # Turn toward the ball if it is outside the center deadzone.
-    if error_x < -CENTER_DEADZONE:
-        return "ALIGN LEFT", TURN_SPEED, -TURN_SPEED
+    error = ball_x - frame_center
 
-    if error_x > CENTER_DEADZONE:
-        return "ALIGN RIGHT", -TURN_SPEED, TURN_SPEED
+    # Ball is close enough: stop.
+    if ball_area >= STOP_AREA:
+        stop_robot()
+        print("Ball reached - STOP")
+        return
 
-    # Ball is centered and not yet close: move forward.
-    return "APPROACH", -APPROACH_SPEED, -APPROACH_SPEED
+    # Ball is too far left or right:
+    # Rotate in place to align with it.
+    if abs(error) > CENTER_TOLERANCE:
+
+        turn_speed = int(
+            KP * abs(error)
+        )
+
+        turn_speed = np.clip(
+            turn_speed,
+            MIN_TURN_SPEED,
+            MAX_TURN_SPEED
+        )
+
+        if error < 0:
+            # Ball is on the left
+            send_motor(-turn_speed, turn_speed)
+            print("Turning LEFT")
+
+        else:
+            # Ball is on the right
+            send_motor(turn_speed, -turn_speed)
+            print("Turning RIGHT")
+
+    else:
+        # Ball is approximately centered
+        send_motor(
+            FORWARD_SPEED,
+            FORWARD_SPEED
+        )
+
+        print("Moving FORWARD")
 
 
 # ==========================================
-# 6. ARDUINO MOTOR COMMUNICATION
+# MAIN LOOP
 # ==========================================
 
-def send_motor_command(left_speed, right_speed):
-    """Send 'left,right\\n' to the Arduino, clamped to -255..255."""
-    if not MOTORS_ENABLED:
-        left_speed = 0
-        right_speed = 0
-
-    left_speed = max(-255, min(255, int(left_speed)))
-    right_speed = max(-255, min(255, int(right_speed)))
-
-    command = f"{left_speed},{right_speed}\n"
-    arduino.write(command.encode("ascii"))
-
-
-def stop_motors():
-    """Send an immediate stop command."""
-    try:
-        arduino.write(b"0,0\n")
-    except (serial.SerialException, OSError):
-        pass
-
-
-# ==========================================
-# 7. MAIN AUTONOMOUS LOOP
-# ==========================================
-
-print("========================================")
-print(" AUTONOMOUS SOCCER ROBOT")
-print("========================================")
-print(f"Camera index: {CAMERA_INDEX}")
-print(f"Arduino port: {SERIAL_PORT}")
-print(f"Motor control enabled: {MOTORS_ENABLED}")
-print("Press Q or ESC to quit.")
-
-last_timestamp = 0
-last_command_time = 0.0
-missed_frames = 0
-last_state = None
-running = True
+print("Robot ball-following started")
+print("Press Q to stop")
 
 try:
-    stop_motors()
 
-    while running:
+    while True:
+
         ret, frame = cap.read()
 
         if not ret:
-            print("Cannot receive camera frame.")
+            stop_robot()
+            print("Camera error")
             break
 
-        height, width = frame.shape[:2]
+        ball, mask = detect_ball(frame)
 
-        # Run the user's calibrated red-ball detector.
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = make_red_mask(hsv)
-
-        ball, last_timestamp = find_ball_mediapipe(
-            frame, mask, last_timestamp
+        # Draw camera center
+        cv2.line(
+            frame,
+            (FRAME_WIDTH // 2, 0),
+            (FRAME_WIDTH // 2, FRAME_HEIGHT),
+            (255, 255, 0),
+            2
         )
-        detection_source = "MediaPipe"
-
-        if ball is None:
-            ball = find_ball_opencv(mask)
-            detection_source = "OpenCV"
 
         if ball is not None:
-            missed_frames = 0
-            ball_x, ball_y, ball_radius = ball
-            state, left_speed, right_speed = decide_movement(
-                ball, width
+
+            x, y, w, h = ball["box"]
+
+            cv2.rectangle(
+                frame,
+                (x, y),
+                (x + w, y + h),
+                (0, 255, 0),
+                2
             )
-            error_x = ball_x - (width // 2)
 
-        else:
-            missed_frames += 1
-            ball_x = ball_y = ball_radius = 0
-            error_x = 0
-
-            # Briefly stop during short detection interruptions.
-            # Start searching only after several consecutive misses.
-            if missed_frames < LOST_FRAMES_BEFORE_SEARCH:
-                state = "BALL LOST - WAITING"
-                left_speed = 0
-                right_speed = 0
-            else:
-                state, left_speed, right_speed = decide_movement(
-                    None, width
-                )
-
-        # Send motor commands at a fixed interval.
-        current_time = time.monotonic()
-        if current_time - last_command_time >= COMMAND_INTERVAL:
-            send_motor_command(left_speed, right_speed)
-            last_command_time = current_time
-
-        # Print state changes rather than flooding the terminal.
-        if state != last_state:
-            print(
-                f"State: {state} | "
-                f"Left: {left_speed} | Right: {right_speed}"
-            )
-            last_state = state
-
-        # Draw camera center and alignment boundaries.
-        center_x = width // 2
-        cv2.line(
-            frame, (center_x, 0), (center_x, height),
-            (255, 0, 0), 1
-        )
-        cv2.line(
-            frame,
-            (center_x - CENTER_DEADZONE, 0),
-            (center_x - CENTER_DEADZONE, height),
-            (120, 120, 120), 1
-        )
-        cv2.line(
-            frame,
-            (center_x + CENTER_DEADZONE, 0),
-            (center_x + CENTER_DEADZONE, height),
-            (120, 120, 120), 1
-        )
-
-        # Draw detection information.
-        if ball is not None:
             cv2.circle(
-                frame, (ball_x, ball_y), ball_radius,
-                (0, 255, 0), 3
-            )
-            cv2.circle(
-                frame, (ball_x, ball_y), 5,
-                (0, 0, 255), -1
+                frame,
+                (ball["x"], ball["y"]),
+                5,
+                (255, 0, 0),
+                -1
             )
 
             cv2.putText(
                 frame,
-                f"BALL ({detection_source}): X={ball_x}, Y={ball_y}",
-                (10, 30),
+                f"Area: {int(ball['area'])}",
+                (x, y - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55, (0, 255, 0), 2,
-            )
-            cv2.putText(
-                frame,
-                f"ERROR: {error_x:+d}  RADIUS: {ball_radius}",
-                (10, 58),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, (0, 255, 0), 2,
-            )
-        else:
-            cv2.putText(
-                frame,
-                "SEARCHING FOR BALL...",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65, (0, 0, 255), 2,
+                0.6,
+                (0, 255, 0),
+                2
             )
 
-        cv2.putText(
-            frame,
-            f"STATE: {state}",
-            (10, height - 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65, (255, 255, 0), 2,
-        )
-        cv2.putText(
-            frame,
-            f"LEFT: {left_speed} RIGHT: {right_speed}",
-            (10, height - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55, (255, 255, 255), 2,
-        )
+        follow_ball(ball)
 
-        motor_status = (
-            "MOTORS ENABLED" if MOTORS_ENABLED
-            else "MOTORS DISABLED"
-        )
-        cv2.putText(
-            frame,
-            motor_status,
-            (width - 220, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 255, 0) if MOTORS_ENABLED else (0, 0, 255),
-            2,
-        )
-
-        cv2.imshow("Autonomous Soccer Robot", frame)
-        cv2.imshow("Red Detection Mask", mask)
+        cv2.imshow("Robot Camera", frame)
+        cv2.imshow("Ball Mask", mask)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord("q") or key == 27:
-            running = False
 
-except KeyboardInterrupt:
-    print("Program interrupted by user.")
+        if key == ord("q"):
+            break
 
 finally:
-    # Always request zero motor speed before closing the connection.
-    stop_motors()
-    time.sleep(0.1)
 
-    try:
-        arduino.close()
-    except (serial.SerialException, OSError):
-        pass
+    stop_robot()
 
     cap.release()
-    detector.close()
     cv2.destroyAllWindows()
-    print("Robot controller stopped.")
+
+    arduino.close()
+
+    print("Robot stopped safely")
